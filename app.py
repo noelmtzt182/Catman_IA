@@ -1,10 +1,16 @@
-
 import io
+import os
+ 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+ 
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
  
 st.set_page_config(
     page_title="Category Management AI Analyzer",
@@ -12,8 +18,15 @@ st.set_page_config(
     layout="wide",
 )
  
+MODELOS_DISPONIBLES = [
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-haiku-4-5-20251001",
+    "claude-fable-5",
+]
+ 
 # ----------------------------------------------------------------------
-# Utilidades
+# Utilidades: datos
 # ----------------------------------------------------------------------
  
 REQUIRED_FIELDS = {
@@ -88,12 +101,100 @@ def kpi_card(col, label, value, delta=None, help_text=None):
     col.metric(label, value, delta=delta, help=help_text)
  
  
+def md_tabla(df_in: pd.DataFrame, max_filas: int = None) -> str:
+    """Convierte un dataframe a una tabla markdown compacta para pasarle a la IA."""
+    d = df_in.copy()
+    if max_filas:
+        d = d.head(max_filas)
+    # Evitar notación científica en columnas numéricas grandes (ventas, etc.)
+    for col in d.select_dtypes(include=[np.number]).columns:
+        if (d[col].abs() >= 1).any() and (d[col] % 1 == 0).all():
+            d[col] = d[col].map(lambda v: f"{v:,.0f}")
+        else:
+            d[col] = d[col].map(lambda v: f"{v:,.2f}")
+    try:
+        return d.to_markdown(index=False, disable_numparse=True)
+    except ImportError:
+        return d.to_csv(index=False)
+ 
+ 
 # ----------------------------------------------------------------------
-# Sidebar: carga de datos
+# Utilidades: IA (Claude API)
+# ----------------------------------------------------------------------
+ 
+ 
+def get_client():
+    api_key = st.session_state.get("api_key") or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key or anthropic is None:
+        return None
+    return anthropic.Anthropic(api_key=api_key)
+ 
+ 
+def generar_insights_ia(contexto: str, client, modelo: str) -> str:
+    system = (
+        "Sos un consultor senior de Category Management y Trade Marketing. "
+        "A continuación te paso datos agregados YA CALCULADOS de una categoría "
+        "(KPIs, clasificación ABC, market share, productividad de surtido, "
+        "tendencias). Con esa información redactá un análisis ejecutivo en "
+        "español, en formato markdown, con estas secciones: "
+        "1) Diagnóstico general (2-3 líneas), "
+        "2) Hallazgos clave por marca/subcategoría, "
+        "3) Riesgos u oportunidades, "
+        "4) Recomendaciones accionables priorizadas (máximo 5, concretas). "
+        "Citá los números que te paso. No inventes datos que no estén en el "
+        "contexto ni asumas causas que no puedas justificar con los datos."
+    )
+    resp = client.messages.create(
+        model=modelo,
+        max_tokens=1600,
+        temperature=0.4,
+        system=system,
+        messages=[{"role": "user", "content": f"Datos de la categoría:\n\n{contexto}\n\nGenerá el análisis."}],
+    )
+    return resp.content[0].text
+ 
+ 
+def responder_chat(pregunta_historial, contexto: str, client, modelo: str) -> str:
+    system = (
+        "Sos un analista de Category Management. Respondé preguntas sobre la "
+        "categoría usando EXCLUSIVAMENTE los datos agregados que te paso a "
+        "continuación. Si la pregunta no se puede responder con estos datos, "
+        "decilo explícitamente en vez de inventar cifras. Respondé en español, "
+        "de forma concisa y directa, citando números concretos cuando aplique.\n\n"
+        f"DATOS DE LA CATEGORÍA:\n{contexto}"
+    )
+    resp = client.messages.create(
+        model=modelo,
+        max_tokens=900,
+        temperature=0.3,
+        system=system,
+        messages=pregunta_historial,
+    )
+    return resp.content[0].text
+ 
+ 
+# ----------------------------------------------------------------------
+# Sidebar: configuración de IA + carga de datos
 # ----------------------------------------------------------------------
  
 st.sidebar.title("📊 Category Management AI")
 st.sidebar.caption("Analizador de categorías para trade marketing")
+ 
+with st.sidebar.expander("🤖 Configuración de IA", expanded=False):
+    if anthropic is None:
+        st.error("Falta instalar el paquete `anthropic` (pip install anthropic).")
+    st.text_input(
+        "API key de Anthropic",
+        type="password",
+        key="api_key",
+        help="Se usa solo en esta sesión, no se guarda en ningún lado. "
+        "También podés setearla como variable de entorno ANTHROPIC_API_KEY.",
+    )
+    st.selectbox("Modelo", MODELOS_DISPONIBLES, index=0, key="modelo_ia")
+    st.caption(
+        "Necesaria para los tabs '🤖 Insights IA' y '💬 Chat'. El resto de la "
+        "app funciona sin API key."
+    )
  
 modo = st.sidebar.radio(
     "Fuente de datos",
@@ -207,11 +308,17 @@ total_unidades = df["unidades"].sum() if "unidades" in df.columns else None
 n_skus = df["sku"].nunique()
 n_marcas = df["marca"].nunique()
  
+tiene_fecha = "fecha" in df.columns and df["fecha"].notna().any()
+ 
 crecimiento = None
-if "fecha" in df.columns and df["fecha"].notna().any():
+serie_mensual_df = None
+if tiene_fecha:
     serie_mensual = df.groupby(df["fecha"].dt.to_period("M"))["ventas"].sum().sort_index()
     if len(serie_mensual) >= 2:
         crecimiento = (serie_mensual.iloc[-1] / serie_mensual.iloc[-2] - 1) * 100 if serie_mensual.iloc[-2] else None
+    serie_mensual_df = serie_mensual.reset_index()
+    serie_mensual_df["fecha"] = serie_mensual_df["fecha"].astype(str)
+    serie_mensual_df.columns = ["mes", "ventas"]
  
 c1, c2, c3, c4 = st.columns(4)
 kpi_card(c1, "Ventas totales", f"${total_ventas:,.0f}")
@@ -220,25 +327,129 @@ if total_unidades is not None:
 kpi_card(c3, "SKUs activos", f"{n_skus:,}")
 kpi_card(c4, "Marcas", f"{n_marcas:,}", delta=f"{crecimiento:+.1f}% vs mes anterior" if crecimiento is not None else None)
  
-tabs = st.tabs(["📈 Tendencias", "🅰️ ABC / Pareto", "🥧 Market Share", "🧩 Surtido", "💡 Recomendaciones"])
+# ----------------------------------------------------------------------
+# Cálculos centrales (se reutilizan en varios tabs, incluida la IA)
+# ----------------------------------------------------------------------
+ 
+ventas_sku = df.groupby(["sku", "producto", "marca"], as_index=False)["ventas"].sum()
+abc = clasificar_abc(ventas_sku, "ventas")
+ 
+resumen_abc = abc.groupby("clase_abc").agg(
+    skus=("sku", "count"), ventas=("ventas", "sum")
+).reset_index()
+resumen_abc["% ventas"] = (resumen_abc["ventas"] / resumen_abc["ventas"].sum() * 100).round(1)
+resumen_abc["% skus"] = (resumen_abc["skus"] / resumen_abc["skus"].sum() * 100).round(1)
+ 
+share = df.groupby("marca", as_index=False)["ventas"].sum().sort_values("ventas", ascending=False)
+share["share_%"] = (share["ventas"] / share["ventas"].sum() * 100).round(1)
+ 
+prod = df.groupby("marca").agg(skus=("sku", "nunique"), ventas=("ventas", "sum")).reset_index()
+prod["% skus"] = (prod["skus"] / prod["skus"].sum() * 100).round(1)
+prod["% ventas"] = (prod["ventas"] / prod["ventas"].sum() * 100).round(1)
+prod["indice_productividad"] = (prod["% ventas"] / prod["% skus"]).round(2)
+ 
+cola_larga = abc[abc["clase_abc"] == "C"].sort_values("ventas")
+ 
+share_tiempo = None
+var_pct = None
+if tiene_fecha:
+    share_tiempo = (
+        df.groupby([df["fecha"].dt.to_period("M").dt.to_timestamp(), "marca"])["ventas"]
+        .sum()
+        .reset_index()
+    )
+    share_tiempo["share_%"] = share_tiempo.groupby("fecha")["ventas"].transform(lambda x: x / x.sum() * 100)
+ 
+    top_var = df.pivot_table(
+        index=["sku", "producto"],
+        columns=df["fecha"].dt.to_period("M"),
+        values="ventas",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    if top_var.shape[1] >= 2:
+        var_pct = (top_var.iloc[:, -1] - top_var.iloc[:, -2]) / top_var.iloc[:, -2].replace(0, np.nan) * 100
+        var_pct = var_pct.dropna().sort_values(ascending=False)
+ 
+pivot_canal = None
+if "canal" in df.columns:
+    pivot_canal = df.groupby("canal", as_index=False)["ventas"].sum().sort_values("ventas", ascending=False)
+ 
+pivot_subcat = None
+if "subcategoria" in df.columns:
+    pivot_subcat = df.groupby("subcategoria", as_index=False)["ventas"].sum().sort_values("ventas", ascending=False)
+ 
+ 
+def construir_contexto_datos() -> str:
+    partes = [
+        "## KPIs generales",
+        f"- Ventas totales: ${total_ventas:,.0f}",
+        f"- SKUs activos: {n_skus}",
+        f"- Marcas: {n_marcas}",
+    ]
+    if total_unidades is not None:
+        partes.append(f"- Unidades totales: {total_unidades:,.0f}")
+    if crecimiento is not None:
+        partes.append(f"- Crecimiento último mes vs anterior: {crecimiento:+.1f}%")
+ 
+    partes.append("\n## Clasificación ABC (resumen)")
+    partes.append(md_tabla(resumen_abc))
+ 
+    partes.append("\n## Market share por marca")
+    partes.append(md_tabla(share[["marca", "ventas", "share_%"]]))
+ 
+    partes.append("\n## Productividad de surtido por marca (skus, % skus, % ventas, índice)")
+    partes.append(md_tabla(prod))
+ 
+    partes.append("\n## SKUs cola larga (clase C, ordenados de menor a mayor venta) — top 20")
+    partes.append(md_tabla(cola_larga[["sku", "producto", "marca", "ventas", "pct"]], max_filas=20))
+ 
+    if serie_mensual_df is not None:
+        partes.append("\n## Ventas totales por mes")
+        partes.append(md_tabla(serie_mensual_df))
+ 
+    if var_pct is not None:
+        partes.append("\n## Variación % de ventas último mes vs anterior, por SKU (top 15 subas y bajas)")
+        vp = var_pct.reset_index()
+        vp.columns = ["sku", "producto", "variacion_%"]
+        partes.append("Mayores subas:\n" + md_tabla(vp.head(15)))
+        partes.append("Mayores bajas:\n" + md_tabla(vp.tail(15).sort_values("variacion_%")))
+ 
+    if pivot_canal is not None:
+        partes.append("\n## Ventas por canal")
+        partes.append(md_tabla(pivot_canal))
+ 
+    if pivot_subcat is not None:
+        partes.append("\n## Ventas por subcategoría")
+        partes.append(md_tabla(pivot_subcat))
+ 
+    return "\n".join(partes)
+ 
+ 
+contexto_datos = construir_contexto_datos()
+ 
+tabs = st.tabs(
+    [
+        "📈 Tendencias",
+        "🅰️ ABC / Pareto",
+        "🥧 Market Share",
+        "🧩 Surtido",
+        "💡 Recomendaciones",
+        "🤖 Insights IA",
+        "💬 Chat con tus datos",
+    ]
+)
  
 # ----------------------------------------------------------------------
 # TAB: Tendencias
 # ----------------------------------------------------------------------
 with tabs[0]:
-    if "fecha" in df.columns and df["fecha"].notna().any():
+    if tiene_fecha:
         serie = df.groupby(df["fecha"].dt.to_period("M").dt.to_timestamp())["ventas"].sum().reset_index()
         fig = px.line(serie, x="fecha", y="ventas", markers=True, title="Evolución de ventas por mes")
         st.plotly_chart(fig, use_container_width=True)
  
-        top_var = (
-            df.groupby(["sku", "producto"])
-            .apply(lambda g: g.groupby(g["fecha"].dt.to_period("M"))["ventas"].sum())
-            .unstack(fill_value=0)
-        )
-        if top_var.shape[1] >= 2:
-            var_pct = (top_var.iloc[:, -1] - top_var.iloc[:, -2]) / top_var.iloc[:, -2].replace(0, np.nan) * 100
-            var_pct = var_pct.dropna().sort_values(ascending=False)
+        if var_pct is not None:
             colA, colB = st.columns(2)
             with colA:
                 st.markdown("**🚀 SKUs en mayor crecimiento (últ. mes)**")
@@ -254,14 +465,6 @@ with tabs[0]:
 # ----------------------------------------------------------------------
 with tabs[1]:
     st.markdown("Clasificación **ABC** de SKUs según su aporte acumulado a las ventas (regla 80/15/5).")
-    ventas_sku = df.groupby(["sku", "producto"], as_index=False)["ventas"].sum()
-    abc = clasificar_abc(ventas_sku, "ventas")
- 
-    resumen_abc = abc.groupby("clase_abc").agg(
-        skus=("sku", "count"), ventas=("ventas", "sum")
-    ).reset_index()
-    resumen_abc["% ventas"] = (resumen_abc["ventas"] / resumen_abc["ventas"].sum() * 100).round(1)
-    resumen_abc["% skus"] = (resumen_abc["skus"] / resumen_abc["skus"].sum() * 100).round(1)
  
     colA, colB = st.columns([1, 2])
     with colA:
@@ -288,7 +491,7 @@ with tabs[1]:
  
     with st.expander("Ver detalle completo por SKU"):
         st.dataframe(
-            abc[["sku", "producto", "ventas", "pct", "pct_acum", "clase_abc"]]
+            abc[["sku", "producto", "marca", "ventas", "pct", "pct_acum", "clase_abc"]]
             .rename(columns={"pct": "% ventas", "pct_acum": "% acumulado"}),
             use_container_width=True,
         )
@@ -297,9 +500,6 @@ with tabs[1]:
 # TAB: Market Share
 # ----------------------------------------------------------------------
 with tabs[2]:
-    share = df.groupby("marca", as_index=False)["ventas"].sum().sort_values("ventas", ascending=False)
-    share["share_%"] = (share["ventas"] / share["ventas"].sum() * 100).round(1)
- 
     colA, colB = st.columns(2)
     with colA:
         fig = px.pie(share, names="marca", values="ventas", title="Market share por marca", hole=0.4)
@@ -307,13 +507,7 @@ with tabs[2]:
     with colB:
         st.dataframe(share, use_container_width=True, hide_index=True)
  
-    if "fecha" in df.columns and df["fecha"].notna().any():
-        share_tiempo = (
-            df.groupby([df["fecha"].dt.to_period("M").dt.to_timestamp(), "marca"])["ventas"]
-            .sum()
-            .reset_index()
-        )
-        share_tiempo["share_%"] = share_tiempo.groupby("fecha")["ventas"].transform(lambda x: x / x.sum() * 100)
+    if share_tiempo is not None:
         fig3 = px.area(share_tiempo, x="fecha", y="share_%", color="marca", title="Evolución del share por marca")
         st.plotly_chart(fig3, use_container_width=True)
  
@@ -322,10 +516,6 @@ with tabs[2]:
 # ----------------------------------------------------------------------
 with tabs[3]:
     st.markdown("Productividad del surtido: compara el **% de SKUs** que aporta cada marca vs su **% de ventas**.")
-    prod = df.groupby("marca").agg(skus=("sku", "nunique"), ventas=("ventas", "sum")).reset_index()
-    prod["% skus"] = (prod["skus"] / prod["skus"].sum() * 100).round(1)
-    prod["% ventas"] = (prod["ventas"] / prod["ventas"].sum() * 100).round(1)
-    prod["indice_productividad"] = (prod["% ventas"] / prod["% skus"]).round(2)
  
     fig = px.scatter(
         prod, x="% skus", y="% ventas", size="ventas", color="marca", text="marca",
@@ -338,20 +528,21 @@ with tabs[3]:
     st.dataframe(prod.sort_values("indice_productividad", ascending=False), use_container_width=True, hide_index=True)
  
     st.markdown("**Cola larga (candidatos a revisión de surtido):** SKUs clase C con menor aporte individual.")
-    ventas_sku_full = df.groupby(["sku", "producto", "marca"], as_index=False)["ventas"].sum()
-    abc_full = clasificar_abc(ventas_sku_full, "ventas")
-    cola_larga = abc_full[abc_full["clase_abc"] == "C"].sort_values("ventas")
     st.dataframe(cola_larga[["sku", "producto", "marca", "ventas", "pct"]].rename(columns={"pct": "% ventas"}),
                  use_container_width=True, hide_index=True)
  
 # ----------------------------------------------------------------------
-# TAB: Recomendaciones automáticas
+# TAB: Recomendaciones automáticas (basadas en reglas)
 # ----------------------------------------------------------------------
 with tabs[4]:
-    st.markdown("### 💡 Insights automáticos")
+    st.markdown("### 💡 Insights automáticos (basados en reglas fijas)")
+    st.caption(
+        "Estos insights se generan con reglas de negocio simples. Para un análisis "
+        "más matizado, redactado por un modelo de lenguaje, mirá el tab '🤖 Insights IA'."
+    )
     insights = []
  
-    n_a = (abc_full["clase_abc"] == "A").sum() if "abc_full" in dir() else (abc["clase_abc"] == "A").sum()
+    n_a = (abc["clase_abc"] == "A").sum()
     total_sku_count = ventas_sku["sku"].nunique()
     insights.append(
         f"**{n_a} SKUs ({n_a/total_sku_count*100:.0f}% del surtido)** generan el **80% de las ventas** "
@@ -378,7 +569,7 @@ with tabs[4]:
             "(muchos SKUs para poco aporte de ventas) — revisar racionalización o negociar mejor exhibición."
         )
  
-    if "fecha" in df.columns and df["fecha"].notna().any() and crecimiento is not None:
+    if crecimiento is not None:
         direccion = "creció" if crecimiento >= 0 else "cayó"
         insights.append(f"Las ventas de la categoría **{direccion} {abs(crecimiento):.1f}%** respecto al mes anterior.")
  
@@ -400,3 +591,84 @@ with tabs[4]:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
  
+# ----------------------------------------------------------------------
+# TAB: Insights IA (LLM)
+# ----------------------------------------------------------------------
+with tabs[5]:
+    st.markdown("### 🤖 Análisis ejecutivo generado con IA")
+    st.caption(
+        "Toma las tablas ya calculadas (ABC, share, productividad, tendencias) y le pide "
+        "a Claude que redacte un diagnóstico y recomendaciones en lenguaje natural."
+    )
+ 
+    client = get_client()
+    if client is None:
+        st.info(
+            "Configurá tu API key de Anthropic en '🤖 Configuración de IA' (panel izquierdo) "
+            "para habilitar esta función."
+        )
+    else:
+        if st.button("Generar análisis con IA", type="primary"):
+            with st.spinner("Analizando la categoría..."):
+                try:
+                    resultado = generar_insights_ia(contexto_datos, client, st.session_state["modelo_ia"])
+                    st.session_state["insights_ia"] = resultado
+                except Exception as e:
+                    st.error(f"No se pudo generar el análisis: {e}")
+ 
+        if st.session_state.get("insights_ia"):
+            st.markdown("---")
+            st.markdown(st.session_state["insights_ia"])
+ 
+        with st.expander("Ver contexto de datos enviado al modelo"):
+            st.text(contexto_datos)
+ 
+# ----------------------------------------------------------------------
+# TAB: Chat con tus datos
+# ----------------------------------------------------------------------
+with tabs[6]:
+    st.markdown("### 💬 Preguntale a tus datos")
+    st.caption(
+        "El modelo responde usando solo las tablas agregadas de esta categoría "
+        "(no inventa datos que no estén en el contexto)."
+    )
+ 
+    client = get_client()
+    if client is None:
+        st.info(
+            "Configurá tu API key de Anthropic en '🤖 Configuración de IA' (panel izquierdo) "
+            "para habilitar el chat."
+        )
+    else:
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
+ 
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+ 
+        pregunta = st.chat_input("Ej: ¿qué marca perdió más share este trimestre?")
+        if pregunta:
+            st.session_state.chat_history.append({"role": "user", "content": pregunta})
+            with st.chat_message("user"):
+                st.markdown(pregunta)
+ 
+            with st.chat_message("assistant"):
+                with st.spinner("Pensando..."):
+                    try:
+                        historial_api = [
+                            {"role": m["role"], "content": m["content"]}
+                            for m in st.session_state.chat_history
+                        ]
+                        respuesta = responder_chat(
+                            historial_api, contexto_datos, client, st.session_state["modelo_ia"]
+                        )
+                    except Exception as e:
+                        respuesta = f"Ocurrió un error al consultar el modelo: {e}"
+                    st.markdown(respuesta)
+            st.session_state.chat_history.append({"role": "assistant", "content": respuesta})
+ 
+        if st.session_state.chat_history:
+            if st.button("Borrar conversación"):
+                st.session_state.chat_history = []
+                st.rerun()
