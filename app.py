@@ -147,7 +147,6 @@ def generar_insights_ia(contexto: str, client, modelo: str) -> str:
     resp = client.messages.create(
         model=modelo,
         max_tokens=1600,
-        temperature=0.4,
         system=system,
         messages=[{"role": "user", "content": f"Datos de la categoría:\n\n{contexto}\n\nGenerá el análisis."}],
     )
@@ -166,7 +165,6 @@ def responder_chat(pregunta_historial, contexto: str, client, modelo: str) -> st
     resp = client.messages.create(
         model=modelo,
         max_tokens=900,
-        temperature=0.3,
         system=system,
         messages=pregunta_historial,
     )
@@ -672,3 +670,4 @@ with tabs[6]:
             if st.button("Borrar conversación"):
                 st.session_state.chat_history = []
                 st.rerun()
+ 
